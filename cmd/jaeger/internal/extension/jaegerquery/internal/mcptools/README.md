@@ -12,9 +12,9 @@ Jaeger binary. Operators can add their own without rebuilding, via
 `ai.mcp.skills_dir` — the rest of this file is for them. For writing the skills
 themselves, see [AUTHORING.md](./AUTHORING.md).
 
-## Turning the MCP endpoint on
+## Endpoint Exposure and Trace-Data Access
 
-The `ai.mcp` block enables the endpoint; an empty block is enough:
+The `ai.mcp` block enables the telemetry MCP endpoint on the query HTTP server; an empty block is enough:
 
 ```yaml
 extensions:
@@ -23,9 +23,153 @@ extensions:
       mcp: {}
 ```
 
-It serves at `<basePath>/api/ai/mcp/` on the query port, carrying the telemetry
-tools and `read_skill` with the built-in skills. Point an MCP client there, or
-leave it to an AI chat sidecar configured with `ai.agent_url`.
+It serves streamable HTTP MCP at `<basePath>/api/ai/mcp/` (or `/api/ai/mcp/` when `base_path` is unset) on the **query HTTP port** (default `:16686`).
+
+### Network Exposure
+
+The embedded all-in-one configuration (`cmd/jaeger/internal/all-in-one.yaml`) enables the MCP endpoint by default (`ai: mcp: {}`). Because MCP is intended for remote AI agents (e.g. IDE extensions, Claude Code, Cursor, or remote orchestrators), the query HTTP server binds by default to all network interfaces (`:16686`, matching wildcard `0.0.0.0` or `[::]`) rather than loopback.
+
+In default configurations, the query HTTP server runs with **no TLS and no authenticator**. Any remote client that can route traffic to the query port on the network can dial the MCP endpoint.
+
+### Trace-Data Access
+
+The MCP tools are not a sandboxed or redacted subset of trace data; they call Jaeger's internal `QueryService` directly — the exact same service backing the Jaeger UI and the `/api/` HTTP and gRPC trace query APIs. The registered tools:
+
+- `get_services` — lists service names known to Jaeger.
+- `get_span_names` — lists span operations and span kinds for a service.
+- `search_traces` — searches traces matching filters.
+- `get_span_details` — retrieves detailed span attributes, events, and links.
+- `get_trace_errors` — retrieves error logs and error tags across spans.
+- `get_trace_topology` — builds trace dependency DAGs.
+- `get_critical_path` — computes the critical path of a trace.
+- `get_service_dependencies` — inspects service dependency relationships.
+- `read_skill` — serves Markdown playbooks.
+
+These tools have complete read access to all trace data in the configured storage backends. Jaeger does not redact span attributes or filter sensitive values before returning tool results to an agent.
+
+Consequently, the MCP endpoint is part of the query API's security boundary and must be protected with appropriate network and authentication controls in production.
+
+## Recommended Production Setup
+
+Do not expose unauthenticated query HTTP listeners directly to untrusted networks. To run MCP safely in production, apply the following recommendations:
+
+### 1. Network Perimeter Controls
+
+- Restrict access to port `:16686` using firewall rules, VPC security groups, or Kubernetes NetworkPolicies so only authorized AI agents, sidecars, or trusted internal networks can reach the port.
+- If AI clients or sidecars are co-located on the same host, bind the query HTTP listener specifically to localhost:
+  ```yaml
+  extensions:
+    jaeger_query:
+      http:
+        endpoint: 127.0.0.1:16686
+  ```
+
+### 2. Reverse Proxy or API Gateway (Recommended)
+
+The recommended production architecture places a reverse proxy or API gateway (e.g., Envoy, NGINX, Traefik, or an ingress controller) in front of Jaeger Query:
+
+- **TLS Termination:** The proxy terminates TLS with managed certificates.
+- **Authentication & Authorization:** The proxy authenticates remote AI clients using enterprise schemes such as OAuth2, OIDC, SSO, or mutual TLS (mTLS), and enforces authorization policies before forwarding requests to `/api/ai/mcp/`.
+- **Rate Limiting:** Protects the query service against aggressive agent polling or denial-of-service.
+
+### 3. In-Process Basic Authentication and TLS
+
+When an external reverse proxy is not used, Jaeger can terminate TLS and enforce HTTP Basic Authentication directly using the shipped OpenTelemetry Collector `basicauth` server authenticator extension (`basicauthextension`):
+
+```yaml
+service:
+  extensions: [jaeger_storage, basicauth/server, jaeger_query]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter]
+
+extensions:
+  basicauth/server:
+    htpasswd:
+      file: /etc/jaeger/htpasswd
+
+  jaeger_query:
+    http:
+      endpoint: 0.0.0.0:16686
+      auth:
+        authenticator: basicauth/server
+      tls:
+        cert_file: /etc/jaeger/certs/server.crt
+        key_file: /etc/jaeger/certs/server.key
+        min_version: "1.3"
+    storage:
+      traces: some_storage
+    ai:
+      mcp: {}
+```
+
+When `auth.authenticator` is set on `extensions.jaeger_query.http`, the authenticator guards all routes on the query HTTP listener, including `/api/ai/mcp/`.
+
+> **Important:** Basic authentication credentials are sent as Base64-encoded strings on each HTTP request. Never configure `basicauth` without enabling TLS.
+
+### Security Boundaries: Jaeger Controls vs External Controls
+
+- **No in-process RBAC or user identity:** Jaeger does not implement caller identities, user accounts, roles, or permissions, and does not record an audit log of who read a trace.
+- **Bearer tokens:** Incoming `Authorization: Bearer` tokens are not validated by Jaeger. If `bearer_token_propagation: true` is configured, tokens are passed through to the storage backend, delegating token validation to that storage system.
+
+## Disabling the MCP Endpoint
+
+If MCP is not needed, disable it to reduce attack surface.
+
+The endpoint is gated strictly by the presence of the `mcp` block under `extensions.jaeger_query.ai`:
+
+### In Custom Configuration
+
+In custom configuration files, simply omit or remove the `mcp` block:
+
+```yaml
+extensions:
+  jaeger_query:
+    ai:
+      agent_url: ws://localhost:16688
+      # mcp block omitted
+```
+
+- **Shared and Turn-Scoped Endpoints:** When `ai.mcp` is omitted, neither the shared `/api/ai/mcp/` endpoint nor the turn-scoped `/api/ai/mcp/<id>/` endpoint is mounted.
+- **Impact on AI Chat:** If `agent_url` is still configured, the chat endpoint (`<basePath>/api/ai/chat`) remains mounted for UI chat, but neither telemetry tools nor contextual UI tools will be available over MCP to the AI sidecar.
+- **Disabling All AI Surfaces:** If AI chat is also not needed, omit the entire `ai` block from `jaeger_query`. When `ai` is absent, no AI routes (`/api/ai/*`) are registered.
+
+### In Embedded All-in-One
+
+The embedded all-in-one configuration (`cmd/jaeger/internal/all-in-one.yaml`) includes `ai: mcp: {}` by default. When running all-in-one, pass an explicit configuration file via `--config /path/to/config.yaml` that omits `mcp` (or omits `ai`); passing `--config` replaces the embedded configuration.
+
+## Multi-Tenancy and Identity Behavior
+
+### Identity in MCP Sessions
+
+MCP sessions carry **no caller identity**. Jaeger does not authenticate the identity of an AI agent or map MCP sessions to individual user identities or roles.
+
+### Multi-Tenancy Enforcement
+
+When multi-tenancy is enabled on the query extension (`extensions.jaeger_query.multi_tenancy.enabled: true`):
+
+1. **Header Requirement:** Every HTTP request to `/api/ai/mcp/` is checked by Jaeger's tenancy middleware. Callers must provide the configured tenant header (default: `x-tenant`).
+   - A missing tenant header returns `401 Unauthorized` (`missing tenant header`).
+   - If an allowed tenants list is configured (`multi_tenancy.tenants: [...]`) and the provided tenant is not in the list, Jaeger returns `401 Unauthorized` (`unknown tenant`).
+   - If `tenants` is omitted or empty, any non-empty tenant header is accepted.
+2. **Context Propagation to Storage:** Once accepted, the tenant value is injected into the request context (`tenancy.WithTenant`) and propagated through `QueryService` to storage queries. The storage backend partitions and returns only trace data belonging to that tenant.
+
+### Streamable HTTP Session State vs Tenancy
+
+Streamable HTTP MCP maintains transport-level session state tracked via the `Mcp-Session-Id` header (expiring after 5 minutes of inactivity). However:
+
+- Tenancy is evaluated and extracted **on each HTTP request**.
+- MCP does not bind a session to a single tenant at initialization or enforce session-locked tenant isolation inside the MCP session layer.
+- Clients must include the tenant header on every HTTP request.
+
+### Security Limitations
+
+Multi-tenancy in Jaeger is a mechanism for **storage data segregation**, not cryptographic authentication:
+
+- Jaeger does not verify credentials or signatures inside the tenant header.
+- In production, upstream infrastructure (such as an API gateway or reverse proxy) must authenticate the caller, determine their authorized tenant, and inject or sanitize the `x-tenant` header before proxying requests to Jaeger.
 
 ## Adding installation-specific skills
 
