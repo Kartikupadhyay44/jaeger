@@ -45,6 +45,12 @@ func NewServer(failures FailureConfig) *httptest.Server {
 			block.AddColumn("revision()", "UInt32")
 			block.AddColumn("timezone()", "String")
 			block.Append("mock-server", "23.3.1", chproto.DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, "UTC")
+		case "SELECT engine FROM system.databases WHERE name = 'shared_db'":
+			block.AddColumn("engine", "String")
+			block.Append("Shared")
+		case "SELECT engine FROM system.databases WHERE name = 'replicated_db'":
+			block.AddColumn("engine", "String")
+			block.Append("Replicated")
 		default:
 		}
 

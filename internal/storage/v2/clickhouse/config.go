@@ -45,6 +45,11 @@ type Configuration struct {
 	// Exactly one of its variants must be set when CreateSchema is true; the block is
 	// ignored otherwise, because the operator then owns the tables.
 	TableEngine TableEngine `mapstructure:"table_engine"`
+	// Distributed, if set to true, enables multi-node distributed schema generation when
+	// CreateSchema is true. It creates local storage tables (with a _local suffix),
+	// Distributed table wrappers under the public table names, and attaches materialized
+	// views to the local tables.
+	Distributed bool `mapstructure:"distributed"`
 	// DefaultSearchDepth is the default search depth for queries.
 	// This is the maximum number of trace IDs that will be returned when searching for traces
 	// if a limit is not specified in the query.
@@ -100,6 +105,9 @@ type ReplicatedEngine struct {
 	// ReplicaName identifies this replica under KeeperPath. The same value is used for
 	// every table, which is what the `{replica}` macro expects.
 	ReplicaName string `mapstructure:"replica_name"`
+	// Cluster is the ClickHouse cluster name. When set, Distributed table wrappers use
+	// this cluster.
+	Cluster string `mapstructure:"cluster"`
 }
 
 // engineFamily is the local engine of a table in the schema, which a TableEngine
@@ -133,10 +141,10 @@ func (e TableEngine) engineClause(family engineFamily) (string, error) {
 	if (r.KeeperPath == "") != (r.ReplicaName == "") {
 		return "", errors.New("`table_engine.replicated` must set `keeper_path` and `replica_name` together or neither")
 	}
-	// Both values are rendered inside single-quoted SQL literals, where a quote ends the
+	// Values are rendered inside single-quoted SQL literals, where a quote ends the
 	// literal and a backslash escapes the character after it.
-	if strings.ContainsAny(r.KeeperPath, `'\`) || strings.ContainsAny(r.ReplicaName, `'\`) {
-		return "", errors.New("`table_engine.replicated` `keeper_path` and `replica_name` must not contain a single quote or a backslash")
+	if strings.ContainsAny(r.KeeperPath, `'\`) || strings.ContainsAny(r.ReplicaName, `'\`) || strings.ContainsAny(r.Cluster, `'\`) {
+		return "", errors.New("`table_engine.replicated` `keeper_path`, `replica_name`, and `cluster` must not contain a single quote or a backslash")
 	}
 	if r.KeeperPath == "" {
 		return "Replicated" + string(family), nil
@@ -193,6 +201,44 @@ func (cfg *Configuration) Validate() error {
 		if _, err := cfg.TableEngine.engineClause(mergeTreeFamily); err != nil {
 			return err
 		}
+		if cfg.Distributed {
+			if cfg.Database == "" {
+				return errors.New("database must not be empty when distributed is enabled")
+			}
+			if !isValidIdentifier(cfg.Database) {
+				return errors.New("database must be a valid ClickHouse identifier")
+			}
+			if cfg.TableEngine.Replicated.HasValue() {
+				r := cfg.TableEngine.Replicated.Get()
+				if r.Cluster != "" && !isValidIdentifier(r.Cluster) {
+					return errors.New("`table_engine.replicated.cluster` must be a valid ClickHouse identifier")
+				}
+			}
+		}
 	}
 	return nil
+}
+
+func isIdentifierStart(ch rune) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_'
+}
+
+func isIdentifierPart(ch rune) bool {
+	return isIdentifierStart(ch) || (ch >= '0' && ch <= '9')
+}
+
+func isValidIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, ch := range name {
+		if i == 0 {
+			if !isIdentifierStart(ch) {
+				return false
+			}
+		} else if !isIdentifierPart(ch) {
+			return false
+		}
+	}
+	return true
 }

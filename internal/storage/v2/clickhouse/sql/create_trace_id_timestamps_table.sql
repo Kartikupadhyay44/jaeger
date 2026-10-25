@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS trace_id_timestamps
+CREATE TABLE IF NOT EXISTS {{ if .TableName }}{{ .TableName }}{{ else }}trace_id_timestamps{{ end }}
 (
     trace_id String,
     start SimpleAggregateFunction(min, DateTime64(9)),

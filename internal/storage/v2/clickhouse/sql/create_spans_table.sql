@@ -1,5 +1,5 @@
 CREATE TABLE
-    IF NOT EXISTS spans (
+    IF NOT EXISTS {{ if .TableName }}{{ .TableName }}{{ else }}spans{{ end }} (
         id String,
         trace_id String,
         trace_state String,

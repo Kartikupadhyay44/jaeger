@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS
-    operations (
+    {{ if .TableName }}{{ .TableName }}{{ else }}operations{{ end }} (
         service_name String,
         name String,
         span_kind String

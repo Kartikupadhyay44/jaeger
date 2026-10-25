@@ -1,5 +1,5 @@
 CREATE TABLE
-    IF NOT EXISTS dependencies (
+    IF NOT EXISTS {{ if .TableName }}{{ .TableName }}{{ else }}dependencies{{ end }} (
         timestamp DateTime64 (9),
         dependencies_json String
     ) ENGINE = {{ .MergeTree }}

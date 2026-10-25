@@ -184,6 +184,141 @@ func TestValidate(t *testing.T) {
 			mutate:  func(cfg *Configuration) { cfg.AttributeMetadataCacheMaxSize = -1 },
 			wantErr: "attribute_metadata_cache_max_size must be a non-negative number",
 		},
+		{
+			name: "create_schema with distributed mode and default database",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.TableEngine.MergeTree = configoptional.Some(MergeTreeEngine{})
+			},
+		},
+		{
+			name: "create_schema with distributed mode and custom database",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.Database = "custom_jaeger"
+				cfg.TableEngine.MergeTree = configoptional.Some(MergeTreeEngine{})
+			},
+		},
+		{
+			name: "create_schema with distributed mode and replicated engine with cluster",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.TableEngine.Replicated = configoptional.Some(ReplicatedEngine{
+					KeeperPath:  "/clickhouse/tables/{shard}/{database}/{table}",
+					ReplicaName: "{replica}",
+					Cluster:     "my_cluster",
+				})
+			},
+		},
+		{
+			name: "create_schema with distributed mode and empty database",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.Database = ""
+				cfg.TableEngine.MergeTree = configoptional.Some(MergeTreeEngine{})
+			},
+			wantErr: "database must not be empty when distributed is enabled",
+		},
+		{
+			name: "create_schema with distributed mode and invalid database with quote",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.Database = "jaeger'db"
+				cfg.TableEngine.MergeTree = configoptional.Some(MergeTreeEngine{})
+			},
+			wantErr: "database must be a valid ClickHouse identifier",
+		},
+		{
+			name: "create_schema with distributed mode and invalid database with space",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.Database = "jaeger db"
+				cfg.TableEngine.MergeTree = configoptional.Some(MergeTreeEngine{})
+			},
+			wantErr: "database must be a valid ClickHouse identifier",
+		},
+		{
+			name: "replicated cluster with quote",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.TableEngine.Replicated = configoptional.Some(ReplicatedEngine{
+					KeeperPath:  "/clickhouse/tables/{shard}/{database}/{table}",
+					ReplicaName: "{replica}",
+					Cluster:     "it's",
+				})
+			},
+			wantErr: "must not contain a single quote or a backslash",
+		},
+		{
+			name: "replicated cluster with backslash",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.TableEngine.Replicated = configoptional.Some(ReplicatedEngine{
+					KeeperPath:  "/clickhouse/tables/{shard}/{database}/{table}",
+					ReplicaName: "{replica}",
+					Cluster:     `cluster\`,
+				})
+			},
+			wantErr: "must not contain a single quote or a backslash",
+		},
+		{
+			name: "create_schema with distributed mode and invalid cluster with semicolon",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.TableEngine.Replicated = configoptional.Some(ReplicatedEngine{
+					KeeperPath:  "/clickhouse/tables/{shard}/{database}/{table}",
+					ReplicaName: "{replica}",
+					Cluster:     "cluster; DROP TABLE",
+				})
+			},
+			wantErr: "`table_engine.replicated.cluster` must be a valid ClickHouse identifier",
+		},
+		{
+			name: "create_schema with distributed mode and database starting with digit",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.Database = "1jaeger"
+				cfg.TableEngine.MergeTree = configoptional.Some(MergeTreeEngine{})
+			},
+			wantErr: "database must be a valid ClickHouse identifier",
+		},
+		{
+			name: "create_schema with distributed mode and database with hyphen",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.Database = "jaeger-db"
+				cfg.TableEngine.MergeTree = configoptional.Some(MergeTreeEngine{})
+			},
+			wantErr: "database must be a valid ClickHouse identifier",
+		},
+		{
+			name: "create_schema with distributed mode and cluster starting with digit",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = true
+				cfg.Distributed = true
+				cfg.TableEngine.Replicated = configoptional.Some(ReplicatedEngine{
+					Cluster: "1cluster",
+				})
+			},
+			wantErr: "`table_engine.replicated.cluster` must be a valid ClickHouse identifier",
+		},
+		{
+			name: "distributed mode not validated without create_schema",
+			mutate: func(cfg *Configuration) {
+				cfg.CreateSchema = false
+				cfg.Distributed = true
+				cfg.Database = "invalid'db"
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -235,6 +370,28 @@ func TestTableEngine_Unmarshal(t *testing.T) {
 			})},
 		},
 		{
+			name: "replicated with cluster",
+			yaml: map[string]any{"replicated": map[string]any{
+				"cluster": "my_cluster",
+			}},
+			want: TableEngine{Replicated: configoptional.Some(ReplicatedEngine{
+				Cluster: "my_cluster",
+			})},
+		},
+		{
+			name: "replicated with cluster and keeper path and replica name",
+			yaml: map[string]any{"replicated": map[string]any{
+				"cluster":      "my_cluster",
+				"keeper_path":  "/clickhouse/tables/{shard}/{database}/{table}",
+				"replica_name": "{replica}",
+			}},
+			want: TableEngine{Replicated: configoptional.Some(ReplicatedEngine{
+				Cluster:     "my_cluster",
+				KeeperPath:  "/clickhouse/tables/{shard}/{database}/{table}",
+				ReplicaName: "{replica}",
+			})},
+		},
+		{
 			name:            "empty block",
 			yaml:            map[string]any{},
 			wantValidateErr: "`create_schema` requires `table_engine`",
@@ -269,6 +426,38 @@ func TestTableEngine_Unmarshal(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestDistributed_Unmarshal(t *testing.T) {
+	cfg := DefaultConfiguration()
+	conf := confmap.NewFromStringMap(map[string]any{
+		"addresses":     []any{"localhost:9000"},
+		"create_schema": true,
+		"distributed":   true,
+		"table_engine": map[string]any{
+			"replicated": map[string]any{
+				"cluster": "my_cluster",
+			},
+		},
+	})
+	err := conf.Unmarshal(&cfg)
+	require.NoError(t, err)
+	require.True(t, cfg.Distributed)
+	require.True(t, cfg.TableEngine.Replicated.HasValue())
+	require.Equal(t, "my_cluster", cfg.TableEngine.Replicated.Get().Cluster)
+	require.NoError(t, cfg.Validate())
+}
+
+func TestIsValidIdentifier(t *testing.T) {
+	require.False(t, isValidIdentifier(""))
+	require.True(t, isValidIdentifier("a"))
+	require.True(t, isValidIdentifier("_"))
+	require.True(t, isValidIdentifier("_jaeger123"))
+	require.True(t, isValidIdentifier("jaeger_db_1"))
+	require.False(t, isValidIdentifier("1jaeger"))
+	require.False(t, isValidIdentifier("jaeger-db"))
+	require.False(t, isValidIdentifier("jaeger db"))
+	require.False(t, isValidIdentifier("jaeger'db"))
 }
 
 func TestDefaultConfiguration(t *testing.T) {

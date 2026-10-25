@@ -6,6 +6,7 @@ package clickhouse
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"text/template"
@@ -58,8 +59,22 @@ var (
 	_ storage.Purger             = (*Factory)(nil)
 )
 
-// schemaTemplateParams is what the CREATE TABLE templates under sql/ are rendered with.
+// schemaTemplateParams is what the CREATE TABLE and materialized view templates under sql/ are rendered with.
 type schemaTemplateParams struct {
+	// TableName is the name of the table being created (e.g. spans or spans_local).
+	TableName string
+	// LocalTableName is the name of the local storage table wrapped by a Distributed table.
+	LocalTableName string
+	// SourceTable is the source table for a materialized view (e.g. spans or spans_local).
+	SourceTable string
+	// TargetTable is the target table for a materialized view (e.g. services or services_local).
+	TargetTable string
+	// Cluster is the ClickHouse cluster name for Distributed tables.
+	Cluster string
+	// Database is the ClickHouse database name for Distributed tables.
+	Database string
+	// ShardingKey is the sharding expression for Distributed tables (e.g. cityHash64(trace_id)).
+	ShardingKey string
 	// TTLSeconds is the retention of spans and trace_id_timestamps; zero renders no TTL clause.
 	TTLSeconds int64
 	// MergeTree is the ENGINE clause body of the tables that hold raw rows.
@@ -78,7 +93,62 @@ type schemaBuilder struct {
 	statements []schemaStatement
 }
 
+func resolveCluster(cfg Configuration) string {
+	if cfg.TableEngine.Replicated.HasValue() {
+		if c := cfg.TableEngine.Replicated.Get().Cluster; c != "" {
+			return c
+		}
+	}
+	if cfg.Database != "" {
+		return cfg.Database
+	}
+	return defaultDatabase
+}
+
+func detectDatabaseCluster(ctx context.Context, conn driver.Conn, cfg Configuration) (string, error) {
+	var configuredCluster string
+	if cfg.TableEngine.Replicated.HasValue() {
+		configuredCluster = cfg.TableEngine.Replicated.Get().Cluster
+	}
+
+	dbName := cfg.Database
+	if dbName == "" {
+		dbName = defaultDatabase
+	}
+
+	var dbEngine string
+	row := conn.QueryRow(ctx, "SELECT engine FROM system.databases WHERE name = ?", dbName)
+	if err := row.Scan(&dbEngine); err == nil {
+		switch dbEngine {
+		case "Shared":
+			if configuredCluster != "" {
+				return "", errors.New("cluster set on a Shared database is a configuration error")
+			}
+			return "default", nil
+		case "Replicated":
+			if configuredCluster != "" {
+				return "", errors.New("cluster set on a Replicated database is a configuration error")
+			}
+			return dbName, nil
+		default:
+			if configuredCluster != "" {
+				return configuredCluster, nil
+			}
+			return dbName, nil
+		}
+	}
+
+	if configuredCluster != "" {
+		return configuredCluster, nil
+	}
+	return dbName, nil
+}
+
 func newSchemaBuilder(cfg Configuration) (*schemaBuilder, error) {
+	return newSchemaBuilderWithCluster(cfg, resolveCluster(cfg))
+}
+
+func newSchemaBuilderWithCluster(cfg Configuration, cluster string) (*schemaBuilder, error) {
 	mergeTree, err := cfg.TableEngine.engineClause(mergeTreeFamily)
 	if err != nil {
 		return nil, err
@@ -87,42 +157,134 @@ func newSchemaBuilder(cfg Configuration) (*schemaBuilder, error) {
 	if err != nil {
 		return nil, err
 	}
-	params := schemaTemplateParams{
-		TTLSeconds:           int64(cfg.TTL / time.Second),
-		MergeTree:            mergeTree,
-		AggregatingMergeTree: aggregatingMergeTree,
+
+	dbName := cfg.Database
+	if dbName == "" {
+		dbName = defaultDatabase
 	}
-	// The materialized views carry no engine of their own, because each writes TO its
-	// target table, so only the tables are templates.
-	schema := []struct {
-		name     string
-		query    string
-		template bool
-	}{
-		{"spans table", sql.CreateSpansTable, true},
-		{"services table", sql.CreateServicesTable, true},
-		{"services materialized view", sql.CreateServicesMaterializedView, false},
-		{"operations table", sql.CreateOperationsTable, true},
-		{"operations materialized view", sql.CreateOperationsMaterializedView, false},
-		{"trace id timestamps table", sql.CreateTraceIDTimestampsTable, true},
-		{"trace id timestamps materialized view", sql.CreateTraceIDTimestampsMaterializedView, false},
-		{"attribute metadata table", sql.CreateAttributeMetadataTable, true},
-		{"attribute metadata materialized view", sql.CreateAttributeMetadataMaterializedView, false},
-		{"event attribute metadata materialized view", sql.CreateEventAttributeMetadataMaterializedView, false},
-		{"link attribute metadata materialized view", sql.CreateLinkAttributeMetadataMaterializedView, false},
-		{"dependencies table", sql.CreateDependenciesTable, true},
-	}
+
 	builder := &schemaBuilder{}
-	for _, s := range schema {
-		query := s.query
-		if s.template {
-			query, err = loadTemplate(s.name, s.query, params)
+
+	if !cfg.Distributed {
+		params := schemaTemplateParams{
+			TableName:            "",
+			SourceTable:          "spans",
+			TTLSeconds:           int64(cfg.TTL / time.Second),
+			MergeTree:            mergeTree,
+			AggregatingMergeTree: aggregatingMergeTree,
+		}
+		schema := []struct {
+			name        string
+			query       string
+			targetTable string
+		}{
+			{"spans table", sql.CreateSpansTable, ""},
+			{"services table", sql.CreateServicesTable, ""},
+			{"services materialized view", sql.CreateServicesMaterializedView, "services"},
+			{"operations table", sql.CreateOperationsTable, ""},
+			{"operations materialized view", sql.CreateOperationsMaterializedView, "operations"},
+			{"trace id timestamps table", sql.CreateTraceIDTimestampsTable, ""},
+			{"trace id timestamps materialized view", sql.CreateTraceIDTimestampsMaterializedView, "trace_id_timestamps"},
+			{"attribute metadata table", sql.CreateAttributeMetadataTable, ""},
+			{"attribute metadata materialized view", sql.CreateAttributeMetadataMaterializedView, "attribute_metadata"},
+			{"event attribute metadata materialized view", sql.CreateEventAttributeMetadataMaterializedView, "attribute_metadata"},
+			{"link attribute metadata materialized view", sql.CreateLinkAttributeMetadataMaterializedView, "attribute_metadata"},
+			{"dependencies table", sql.CreateDependenciesTable, ""},
+		}
+		for _, s := range schema {
+			p := params
+			p.TargetTable = s.targetTable
+			query, err := loadTemplate(s.name, s.query, p)
 			if err != nil {
 				return nil, err
 			}
+			builder.statements = append(builder.statements, schemaStatement{name: s.name, query: query})
 		}
-		builder.statements = append(builder.statements, schemaStatement{name: s.name, query: query})
+		return builder, nil
 	}
+
+	// Distributed schema layout:
+	// 1. Six local storage tables (_local suffix)
+	// 2. Six Distributed wrapper tables (public table names)
+	// 3. Six materialized views attached to local tables
+	localTables := []struct {
+		name      string
+		tableName string
+		query     string
+	}{
+		{"spans local table", "spans_local", sql.CreateSpansTable},
+		{"services local table", "services_local", sql.CreateServicesTable},
+		{"operations local table", "operations_local", sql.CreateOperationsTable},
+		{"trace id timestamps local table", "trace_id_timestamps_local", sql.CreateTraceIDTimestampsTable},
+		{"attribute metadata local table", "attribute_metadata_local", sql.CreateAttributeMetadataTable},
+		{"dependencies local table", "dependencies_local", sql.CreateDependenciesTable},
+	}
+	for _, lt := range localTables {
+		p := schemaTemplateParams{
+			TableName:            lt.tableName,
+			TTLSeconds:           int64(cfg.TTL / time.Second),
+			MergeTree:            mergeTree,
+			AggregatingMergeTree: aggregatingMergeTree,
+		}
+		query, err := loadTemplate(lt.name, lt.query, p)
+		if err != nil {
+			return nil, err
+		}
+		builder.statements = append(builder.statements, schemaStatement{name: lt.name, query: query})
+	}
+
+	distributedWrappers := []struct {
+		name           string
+		tableName      string
+		localTableName string
+		shardingKey    string
+	}{
+		{"spans distributed table", "spans", "spans_local", "cityHash64(trace_id)"},
+		{"services distributed table", "services", "services_local", ""},
+		{"operations distributed table", "operations", "operations_local", ""},
+		{"trace id timestamps distributed table", "trace_id_timestamps", "trace_id_timestamps_local", "cityHash64(trace_id)"},
+		{"attribute metadata distributed table", "attribute_metadata", "attribute_metadata_local", ""},
+		{"dependencies distributed table", "dependencies", "dependencies_local", "cityHash64(timestamp)"},
+	}
+	for _, dw := range distributedWrappers {
+		p := schemaTemplateParams{
+			TableName:      dw.tableName,
+			LocalTableName: dw.localTableName,
+			Cluster:        cluster,
+			Database:       dbName,
+			ShardingKey:    dw.shardingKey,
+		}
+		query, err := loadTemplate(dw.name, sql.CreateDistributedTable, p)
+		if err != nil {
+			return nil, err
+		}
+		builder.statements = append(builder.statements, schemaStatement{name: dw.name, query: query})
+	}
+
+	materializedViews := []struct {
+		name        string
+		targetTable string
+		query       string
+	}{
+		{"services materialized view", "services_local", sql.CreateServicesMaterializedView},
+		{"operations materialized view", "operations_local", sql.CreateOperationsMaterializedView},
+		{"trace id timestamps materialized view", "trace_id_timestamps_local", sql.CreateTraceIDTimestampsMaterializedView},
+		{"attribute metadata materialized view", "attribute_metadata_local", sql.CreateAttributeMetadataMaterializedView},
+		{"event attribute metadata materialized view", "attribute_metadata_local", sql.CreateEventAttributeMetadataMaterializedView},
+		{"link attribute metadata materialized view", "attribute_metadata_local", sql.CreateLinkAttributeMetadataMaterializedView},
+	}
+	for _, mv := range materializedViews {
+		p := schemaTemplateParams{
+			SourceTable: "spans_local",
+			TargetTable: mv.targetTable,
+		}
+		query, err := loadTemplate(mv.name, mv.query, p)
+		if err != nil {
+			return nil, err
+		}
+		builder.statements = append(builder.statements, schemaStatement{name: mv.name, query: query})
+	}
+
 	return builder, nil
 }
 
@@ -192,6 +354,19 @@ func NewFactory(ctx context.Context, cfg Configuration, telset telemetry.Setting
 	}
 
 	if builder != nil {
+		if cfg.Distributed {
+			detectedCluster, detectErr := detectDatabaseCluster(ctx, conn, cfg)
+			if detectErr != nil {
+				return nil, detectErr
+			}
+			if detectedCluster != resolveCluster(cfg) {
+				var err error
+				builder, err = newSchemaBuilderWithCluster(cfg, detectedCluster)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 		if err := builder.build(ctx, conn); err != nil {
 			return nil, err
 		}
